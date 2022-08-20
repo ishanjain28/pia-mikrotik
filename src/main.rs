@@ -1,23 +1,27 @@
 use ipnetwork::{IpNetwork, Ipv4Network};
 use mikrotik::{
-    interface::wireguard::{AddWireguardPeerInput, AllowedAddresses, WireguardPeer},
+    interface::wireguard::{AddWireguardPeerInput, AllowedAddresses},
     ip::address,
 };
+use ping::ping;
 use reqwest::{Certificate, Client, ClientBuilder, Url};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fmt::Display,
     io,
     net::{IpAddr, Ipv4Addr},
     str::FromStr,
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt};
 
-// TODO(ishan): Interface name should not hardcoded to be `pia` and should be user configurable
-
 #[derive(Debug, Error)]
 pub enum PError {
+    #[error(transparent)]
+    PiaError(#[from] PiaError),
+
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
 
@@ -26,45 +30,105 @@ pub enum PError {
 
     #[error(transparent)]
     MikrotikError(#[from] mikrotik::ClientError),
+
+    #[error(transparent)]
+    TomlError(#[from] toml::de::Error),
+}
+
+#[derive(Debug, Error, Deserialize, Serialize)]
+pub struct PiaError {
+    status: String,
+    message: String,
+}
+
+impl Display for PiaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "status = {} message = {}",
+            self.status, self.message,
+        ))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    router_url: String,
+    router_password: String,
+    pia_user: String,
+    pia_pass: String,
+    pia_exit_node_url: String,
+    router_pubkey: String,
+    interface: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), PError> {
-    let token = get_token().await?;
+    let config: Config = {
+        let mut f = File::open("./config.toml").await?;
+
+        let mut contents = String::new();
+        f.read_to_string(&mut contents).await?;
+
+        toml::from_str(&contents)?
+    };
+
+    loop {
+        // 3. Check if the tunnel dies on it's own after some time and we if need to do something to
+        //    keep it active.
+        let wg_details = match activate_tunnel(&config).await {
+            Ok(v) => v,
+            Err(e) => {
+                println!("error in activating tunnel: {:?}", e);
+
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+
+        println!("added address and peer");
+
+        while ping(
+            wg_details.server_vip.parse().unwrap(),
+            Some(Duration::from_secs(30)),
+            Some(0),
+            None,
+            Some(255),
+            None,
+        )
+        .is_ok()
+        {
+            println!("vpn server ip is reachabable");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+}
+
+async fn activate_tunnel(config: &Config) -> Result<RegisterWireguardPubKeyResponse, PError> {
+    let token = get_token(config).await?;
 
     // TODO(ishan): In future, give an option to specify exit node.
     // for now, we assume de-frankfurt, would prefer SG but some issues in the path to SG right now
-    let response = register_wireguard_pub_key(&token.token).await?;
+    let response = register_wireguard_pub_key(config, &token.token).await?;
 
-    // TODO(ishan):
-    // 1. List all addresses in `pia` interface, remove everything except for the address we just
-    //    received in response. DONE
-    // 2. List all peers attached to `pia` interface, remove all peers except for the peer details
-    //    we just received in response. DONE
-    // 3. Check if the tunnel dies on it's own after some time and we if need to do something to
-    //    keep it active.
+    add_address(config, &response).await?;
 
-    println!("{:?}", response);
+    add_peer(config, &response).await?;
 
-    add_address(&response).await?;
-
-    add_peer(&response).await?;
-
-    Ok(())
+    Ok(response)
 }
 
-async fn add_peer(ip: &RegisterWireguardPubKeyResponse) -> Result<(), PError> {
+async fn add_peer(config: &Config, ip: &RegisterWireguardPubKeyResponse) -> Result<(), PError> {
     let mut mclient = mikrotik::Client::new(
-        Url::from_str("https://10.0.99.1").unwrap(),
-        "pia".to_string(),
-        "qwertyuiop".to_string(),
+        Url::from_str(&config.router_url).unwrap(),
+        config.interface.to_string(),
+        config.router_password.to_string(),
         true,
     )?;
 
     let peers = mikrotik::interface::wireguard::list_peers(&mut mclient)
         .await?
         .into_iter()
-        .filter(|peer| peer.interface == "pia");
+        .filter(|peer| peer.interface == config.interface);
 
     mikrotik::interface::wireguard::add_peer(
         &mut mclient,
@@ -76,35 +140,43 @@ async fn add_peer(ip: &RegisterWireguardPubKeyResponse) -> Result<(), PError> {
             disabled: false,
             endpoint_address: Some(IpAddr::from_str(&ip.server_ip).unwrap()),
             endpoint_port: ip.server_port,
-            interface: "pia".to_string(),
+            interface: config.interface.to_string(),
             persistent_keepalive: Some(25),
             preshared_key: None,
             public_key: ip.server_key.clone(),
         },
     )
-    .await?;
+    .await
+    .expect("error in adding peer");
 
     for peer in peers {
-        mikrotik::interface::wireguard::remove_peer(&mut mclient, &peer.id).await?;
+        mikrotik::interface::wireguard::remove_peer(&mut mclient, &peer.id)
+            .await
+            .expect("error in removing peer");
     }
 
     Ok(())
 }
 
-async fn add_address(ip: &RegisterWireguardPubKeyResponse) -> Result<(), PError> {
+async fn add_address(config: &Config, ip: &RegisterWireguardPubKeyResponse) -> Result<(), PError> {
+    // 1. List all addresses in `config.interface` interface, remove everything except for the address we just
+    //    received in response.
+    // 2. List all peers attached to `config.interface` interface, remove all peers except for the peer details
+    //    we just received in response.
+
     let mut mclient = mikrotik::Client::new(
-        Url::from_str("https://10.0.99.1").unwrap(),
-        "pia".to_string(),
-        "qwertyuiop".to_string(),
+        Url::from_str(&config.router_url).unwrap(),
+        config.interface.to_string(),
+        config.router_password.to_string(),
         true,
     )?;
 
-    // This represents all the addresses on `pia` interface.
+    // This represents all the addresses on `config.interface` interface.
     // All but `ip.peer_ip` address have to be removed
     let mut addresses: HashMap<String, String> = address::list(&mut mclient)
         .await?
         .into_iter()
-        .filter(|addr| addr.interface == "pia")
+        .filter(|addr| addr.interface == config.interface)
         .map(|addr| (addr.address, addr.id))
         .collect();
 
@@ -117,7 +189,7 @@ async fn add_address(ip: &RegisterWireguardPubKeyResponse) -> Result<(), PError>
                 address: ip.peer_ip.clone(),
                 comment: Some("Managed by pia-mikrotik".to_string()),
                 disabled: false,
-                interface: "pia".to_string(),
+                interface: config.interface.to_string(),
                 network: None,
             },
         )
@@ -152,9 +224,9 @@ pub struct RegisterWireguardPubKeyResponse {
 }
 
 async fn register_wireguard_pub_key(
+    config: &Config,
     token: &str,
 ) -> Result<RegisterWireguardPubKeyResponse, PError> {
-    let pubkey = std::env::var("PUBKEY").unwrap();
     let certificate = read_certificate().await?;
 
     let client = ClientBuilder::new()
@@ -165,9 +237,10 @@ async fn register_wireguard_pub_key(
 
     let response = client
         .get(format!(
-            "https://sg.privacy.network:1337/addKey?pt={}&pubkey={}",
+            "{}/addKey?pt={}&pubkey={}",
+            config.pia_exit_node_url,
             urlencoding::encode(token),
-            urlencoding::encode(&pubkey)
+            urlencoding::encode(&config.router_pubkey)
         ))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
@@ -183,16 +256,19 @@ pub struct GetTokenOutput {
     token: String,
 }
 
-async fn get_token() -> Result<GetTokenOutput, PError> {
-    let username = std::env::var("PIA_USER").unwrap();
-    let password = Some(std::env::var("PIA_PASS").unwrap());
-
+async fn get_token(config: &Config) -> Result<GetTokenOutput, PError> {
     let client = Client::new();
 
     let response = client
         .get("https://www.privateinternetaccess.com/gtoken/generateToken")
-        .basic_auth(username, password)
+        .basic_auth(&config.pia_user, Some(&config.pia_pass))
         .send();
 
-    Ok(response.await?.json::<GetTokenOutput>().await?)
+    let response = response.await?;
+
+    if response.status().is_success() {
+        Ok(response.json::<GetTokenOutput>().await?)
+    } else {
+        Err(PError::PiaError(response.json::<PiaError>().await?))
+    }
 }
